@@ -11,220 +11,442 @@ Use bullet points. Keep it under 250 words.
 
 [pr_reviewer]
 extra_instructions = """
-You are reviewing DeepSpec — DeepSeek's speculative decoding training/evaluation codebase.
-This is research-grade ML systems code. Before analyzing the PR diff, you MUST research
-and understand the full domain context below.
+You are reviewing DeepSpec (deepseek-ai/DeepSpec) — a research-grade speculative decoding training/evaluation codebase.
+Clone URL: https://github.com/deepseek-ai/DeepSpec.git (main branch, ~15MB)
+Paper: DSpark_paper.pdf in root.
+
+Before analyzing the PR diff, you MUST understand the full codebase at the
+implementation level below. This context comes from the actual cloned repo.
 
 ================================================================================
-DOMAIN RESEARCH — DEEPSPEC SPECULATIVE DECODING
+ACTUAL REPO — CODE-LEVEL CONTEXT
 ================================================================================
 
-## What is DeepSpec?
-DeepSpec is a full-stack codebase from DeepSeek for training and evaluating draft models
-for speculative decoding. It supports three draft-model algorithms: DSpark, DFlash, and Eagle3.
+## Entry Points
 
-Speculative decoding accelerates LLM inference by using a lightweight "draft model" to
-predict multiple tokens that a "target model" verifies in parallel. The draft model is
-trained to match the target model's hidden state distribution.
-
-## Repository Layout
+### train.py (torch multiprocessing spawn — NOT torchrun)
+```python
+if __name__ == "__main__":
+    torch.multiprocessing.spawn(main, nprocs=torch.cuda.device_count())
 ```
-deepspec/                  — Python package
-  data/                    — Target cache loading, chat templates
-  eval/                    — Benchmark evaluation per algorithm
-    dspark/                — DSpark eval
-    eagle3/                — Eagle3 eval
-  modeling/                — Model implementations per algorithm
-    dspark/
-      qwen3/               — Qwen3-specific DSpark model
-      gemma4/              — Gemma4-specific DSpark model
-    eagle3/
-      qwen3/
-      gemma4/
-  trainer/                 — Trainer classes per algorithm (Qwen3DSparkTrainer etc.)
-  utils/                   — Utilities
-config/                    — Algorithm × target-model config files
-  dspark/                  — DSpark configs (dspark_qwen3_4b.py etc.)
-  dflash/                  — DFlash configs
-  eagle3/                  — Eagle3 configs
-eval_datasets/             — Benchmark JSONLs (gsm8k, math500, aime25, humaneval, mbpp, etc.)
-scripts/
-  data/                    — Data preparation pipeline
-  train/                   — Training launcher (train.sh)
-  eval/                    — Evaluation launcher (eval.sh)
-train.py                   — Training entry point
-eval.py                    — Evaluation entry point
+- main(local_rank) parses args, seeds, creates trainer, calls trainer.train(), clean_up()
+- args = parse_args(): --config (required, path to .py config file) + --opts (repeatable: "key.path=value")
+- Prints git sha + git diff before spawning
+- RANK env = node_rank, WORLD_SIZE env = node_count (NOT GPU count)
+
+### eval.py
+```python
+if __name__ == "__main__":
+    args = parse_args()  # --target_name_or_path, --draft_name_or_path, --max-new-tokens, --temperature, --confidence-threshold
 ```
+- Loads draft config from --draft_name_or_path, maps architectures[] to evaluator class
+- EVALUATORS dict: Qwen3DSparkModel, Gemma4DSparkModel, Qwen3Eagle3Model, Gemma4Eagle3Model, Eagle3DraftModel
+- Runs 9 benchmarks: gsm8k(500), math500(500), aime25(30), humaneval(164), mbpp(256), livecodebench(500), mt-bench(80), alpaca(500), arena-hard-v2(500)
 
-## Three Algorithms
+## Central Config System (deepseek/utils/config.py)
 
-### DSpark
-- Uses "blockwise" speculative decoding with a markov head and confidence head
-- Key config params: block_size, num_draft_layers, target_layer_ids, num_anchors
-- markov_rank, markov_head_type ('vanilla')
-- confidence_head_alpha, confidence_head_with_markov
-- Loss: ce_loss_alpha, l1_loss_alpha, loss_decay_gamma (exponential decay on per-layer loss)
-- Trainer class: Qwen3DSparkTrainer (or Gemma4DSparkTrainer)
+- ConfigNode: dict subclass with __getattr__/__setattr__ delegation (access via cfg.foo.bar)
+- load_config(path): importlib loads a .py file, returns ConfigNode of non-dunder module globals
+- parse_opts_to_config(opts, cfg): --opts "train.lr=3e-4" parses with yaml.safe_load, traverses dotted path, updates leaf
+- finalize_config(cfg): optionally calls a finalize_cfg() function from the config module
+- CustomJSONEncoder handles ConfigNode, FunctionType, torch.dtype, Path, Namespace
 
-### DFlash
-- Similar structure to DSpark — see config/dflash/ for params
-- Different loss weighting and architecture
+Config files live in config/ subdirectories:
+  config/dspark/dspark_qwen3_4b.py, dspark_qwen3_8b.py, dspark_qwen3_14b.py, dspark_gemma4_12b.py
+  config/dflash/dflash_*.py (same matrix)
+  config/eagle3/eagle3_*.py (same matrix)
 
-### Eagle3
-- Simpler modeling, fewer config params
-- Faster draft model, different architecture
-- See config/eagle3/ for details
+Every config has 4 dict sections: model, train, logging, data
 
-## Training Pipeline (3 Stages — Must Run in Order)
+### model dict fields:
+- target_model_name_or_path: str
+- block_size: int (draft pred length, e.g. 7)
+- num_draft_layers: int (e.g. 5 for DSpark, 1 for Eagle3)
+- target_layer_ids: list[int] — DSpark: [1,9,17,25,33] for 4B; Eagle3: exactly 5 IDs
+- mask_token_id: int (151669 for Qwen3, depends on target tokenizer)
+- num_anchors: int (DSpark: default 512)
+- markov_rank: int (DSpark: default 256, 0 = no markov head)
+- markov_head_type: str ("vanilla", "gated", or "rnn")
+- confidence_head_alpha: float (0.0 = disabled)
+- confidence_head_with_markov: bool
+- loss_decay_gamma: float (default 4.0, exponential decay across block positions)
+- ce_loss_alpha: float (default 0.1)
+- l1_loss_alpha: float (default 0.9)
+- tie_word_embeddings: bool (forced False in build_draft_config)
 
-### Stage 1: Data Preparation
-1. Download and split prompts: scripts/data/download_and_split.py
-   - Default dataset: mlabonne/open-perfectblend
-   - Output: train_datasets/perfectblend_train.jsonl, eval_datasets/*.jsonl
-2. Regenerate answers with target model via SGLang:
-   - scripts/data/generate_train_data.py
-   - Requires SGLang server running (launch_sglang_server.sh — 8 workers on ports 30000-30007)
-   - Sampling params: temperature, top_p, top_k, min_p (match target model's recommendations)
-   - Output: train_datasets/<model>/perfectblend_train_regen.jsonl
-3. Build target cache:
-   - scripts/data/prepare_target_cache.py
-   - Precomputes per-token hidden states for training loop
-   - STORAGE WARNING: ~38 TB for Qwen3-4B with full dataset
-   - Output: ~/.cache/deepspec/<model>_target_cache
-
-### Stage 2: Training
-Entry point: train.py (NOT torchrun — uses torch.multiprocessing.spawn)
-```python train.py --config config/dspark/dspark_qwen3_4b.py```
-Override any config field: --opts "train.lr=3e-4" --opts "train.local_batch_size=4"
-Checkpoints: ~/checkpoints/<project_name>/<exp_name>/step_*
-
-IMPORTANT: RANK/WORLD_SIZE in this codebase mean node_rank/node_count, NOT GPU rank.
-One worker is spawned per visible GPU. CUDA_VISIBLE_DEVICES controls how many.
-
-### Stage 3: Evaluation
-Entry point: eval.py
-```bash eval.py --target_name_or_path Qwen/Qwen3-4B --draft_name_or_path ~/checkpoints/deepspec/dspark_block8_qwen3_4b/step_latest```
-Benchmarks: gsm8k, math500, aime25, humaneval, mbpp, livecodebench, mt-bench, alpaca, arena-hard-v2
-
-## Config Structure (Python Files)
-
-Each config (e.g. config/dspark/dspark_qwen3_4b.py) has four dict sections:
-
-### model dict
-- target_model_name_or_path: str (e.g., "Qwen/Qwen3-4B")
-- block_size: int (draft prediction length, e.g. 7)
-- num_draft_layers: int (e.g. 5)
-- target_layer_ids: list[int] (layers to extract hidden states from, e.g. [1,9,17,25,33])
-- mask_token_id: int (e.g. 151669 for Qwen3)
-- num_anchors: int (e.g. 512)
-- markov_rank: int (e.g. 256)
-- markov_head_type: str ("vanilla")
-- confidence_head_alpha: float (e.g. 1.0)
-- confidence_head_with_markov: bool (e.g. True)
-- loss_decay_gamma: float (e.g. 4.0)
-- ce_loss_alpha: float (e.g. 0.1)
-- l1_loss_alpha: float (e.g. 0.9)
-
-### train dict
-- trainer_cls: TrainerClass
-- lr: float (e.g. 6.0e-4)
+### train dict fields:
+- trainer_cls: class (not str — eval() resolved in config via import)
+- lr: float
 - warmup_ratio: float (e.g. 0.04)
-- weight_decay: float (e.g. 0.0)
+- weight_decay: float (default 0.0)
 - precision: str ("bf16" or "fp16")
-- local_batch_size: int (per GPU, e.g. 1)
-- global_batch_size: int (e.g. 512, computed as local_batch_size * grad_acc_steps * num_gpus)
+- local_batch_size: int (per GPU)
+- global_batch_size: int (= local_batch_size * grad_acc_steps * num_gpus)
 - num_train_epochs: int (e.g. 10)
 - max_train_steps: int | None
+- sharding_strategy: str (full_shard, shard_grad_op, no_shard, hybrid_shard, hybrid_shard_zero2)
+- torch_compile: bool
+- max_grad_norm: float (e.g. 1.0)
 
-### logging dict
-- TensorBoard output directory, checkpoint interval, logging interval
+### logging dict:
+- checkpoint_dir: str (default ~/checkpoints/<project>/<exp>)
+- tensorboard_dir: str
+- checkpointing_steps: int
+- logging_steps: int
 
-### data dict
-- target_cache_path: str (path to precomputed cache)
+### data dict:
+- target_cache_path: str
 - chat_template: str ("qwen" or "gemma")
 - max_length: int
+- num_workers: int
 
-## Released Checkpoints (Hugging Face)
+## Trainer Hierarchy & Training Loop
 
-Pre-trained on open-perfectblend, non-thinking mode:
+BaseTrainer (deepspec/trainer/base_trainer.py):
+  - __init__: init_dist, precision dtype, FSDP wrap, CacheDataset load, schedule computation, BF16Optimizer, resume
+  - build_models: loads target model from HF, initializes draft model embeddings/head from target (frozen), deletes target
+  - train(): CUDAPrefetcher loop with gradient accumulation + FSDP.no_sync() context
+    - Loss = run_batch(batch) / grad_acc_steps, then backward()
+    - On sync step: FSDP.clip_grad_norm_, optimizer.step(), training_logger.on_optimizer_step()
+    - Checkpoint at interval + on suspend
+  - run_batch(batch): abstract — delegates to subclass (DSpark: compute_dspark_loss, Eagle3: compute_eagle3_loss)
+  - FSDP wrapping: supports full_shard, shard_grad_op, no_shard, hybrid_shard, hybrid_shard_zero2
+  - Hybrid sharding uses init_device_mesh with (replicate, shard) dims
+  - SuspendController: optional hfai cluster suspend/resume, polls in bg thread
+
+Qwen3DSparkTrainer (deepspec/trainer/dspark_trainer.py):
+  - data_collator_cls = CacheCollator
+  - run_batch(batch): calls self.model(...) then compute_dspark_loss(...)
+  - model input signature: input_ids, target_hidden_states, loss_mask, target_last_hidden_states
+  - _build_draft_model: calls build_qwen3_draft_config + Qwen3DSparkModel
+
+Gemma4DSparkTrainer(Qwen3DSparkTrainer):
+  - overrides _build_draft_model only (uses Gemma4DSparkModel + build_gemma4_draft_config)
+
+Qwen3Eagle3Trainer(BaseTrainer):
+  - data_collator_cls = CacheCollator
+  - build_models: loads target model, creates Eagle3 model
+  - run_batch: uses compute_eagle3_loss (Triton-fused soft CE, not standard CE)
+
+Gemma4Eagle3Trainer(Qwen3Eagle3Trainer):
+  - overrides _build_draft_model only
+
+### DSpark Loss (deepspec/modeling/dspark/loss.py)
+compute_dspark_loss(outputs, loss_decay_gamma, ce_loss_alpha, l1_loss_alpha, confidence_head_alpha):
+  1. Builds loss_weight_mask with exponential decay: exp(-pos / loss_decay_gamma)
+  2. CE loss: F.cross_entropy over flattened [B*num_anchors*block_size, V] with weights
+  3. L1 loss (if alpha > 0): |softmax(draft) - softmax(target)| per token, weighted
+  4. Confidence loss (if alpha > 0): BCE with logits on accept_rate_3d (1 - 0.5*|draft - target|_L1)
+  5. All-reduce denominators across GPUs for correct normalization
+  6. Final = (ce_alpha * ce_loss + l1_alpha * l1_loss + conf_alpha * conf_loss) * world_size
+  Backward uses global denominators (summed across GPUs), local loss uses local denominators
+
+### Eagle3 Loss (deepspec/modeling/eagle3/loss.py)
+compute_eagle3_loss(model, batch, ttt_length, step_loss_decay):
+  1. TTT (Test-Time Training) — loops ttt_length steps, each step does draft forward + loss
+  2. Uses FusedLogSoftmaxLoss (Triton kernel) — NOT standard CE
+  3. FusedLogSoftmaxLoss: soft cross-entropy with fused forward/backward Triton kernel
+     - Forward: log-sum-exp trick (keeps only m, d scalars per row, never materializes full log-softmax)
+     - Backward: writes gradient in-place into logits (Liger/Unsloth memory-saving pattern)
+     - Masked positions (position_mask == 0) contribute zero to numerator AND zero gradient
+  4. loss_normalizers = "local_mean" only (valid_token_mean explicitly disabled)
+  5. Step weights: step_weight = step_loss_decay ** step_idx (geometric decay)
+  6. Metrics per step: accuracy@k, accept_rate@k, valid_tokens@k, ploss_k
+  7. Prefix metrics: tau_greedy, tau_probabilistic
+
+## DSpark Modeling (deepspec/modeling/dspark/)
+
+### common.py — shared DSpark utilities
+- DSparkForwardOutput dataclass: draft_logits[B, num_anchors, block_size, V], target_ids, eval_mask, block_keep_mask, confidence_pred, aligned_target_logits
+- AcceptRatePredictor: Linear(input_dim, 1) for confidence head
+- extract_context_feature(hidden_states, layer_ids): concat selected layer outputs
+- sample_anchor_positions: random subset of valid positions (those with loss_mask > 0.5 and next token also valid)
+- build_eval_mask: cumulative product of valid positions (enforces contiguous prefix)
+- create_dspark_attention_mask: flex_attention mask — context region (kv < anchor_pos) attends all, draft region attends same block only
+- create_position_ids: anchor_positions + offset
+- create_noise_embed: fill draft positions with mask_token_id except first position gets actual anchor token
+
+### markov_head.py — 3 head types
+- VanillaMarkov: Embedding(vocab, markov_rank) -> Linear(markov_rank, vocab) bias added to logits
+- GatedMarkovHead: adds sigmoid gate conditioned on hidden_states * prev_embeddings
+- RNNHead: GRU-like state machine — state_k = gate * state_{k-1} + (1-gate) * candidate, bias = W2(tanh(output))
+- build_markov_head(config): returns None if markov_rank == 0
+- Autoregressive sampling: sample_block_tokens iterates over positions, applies bias, samples, feeds next
+
+### qwen3/ — model files
+- Qwen3DSparkModel: custom architecture with:
+  - Qwen3DSparkAttention: replaces standard Qwen3 attention with flex_attention support
+  - forward(): takes input_ids, target_hidden_states, loss_mask, target_last_hidden_states
+  - Block draft structure: samples anchors, creates attention mask, runs backbone layers, applies markov_bias per position, optionally runs confidence head
+- Qwen3DSparkConfig: inherits Qwen3Config, adds DSpark-specific fields
+- build_draft_config(target_config, model_args): copies target config, sets architectures=["Qwen3DSparkModel"], adds draft params
+
+### gemma4/ — Gemma4 variant
+- Same structure, different target model backbone (Gemma4Config)
+
+## DFlash (config/dflash/)
+- Similar structure to DSpark, same config file layout
+- Different algorithm details (see config/dflash/ files for specifics)
+
+## Eagle3 Modeling (deepspec/modeling/eagle3/)
+
+### common.py
+- Eagle3ForwardOutput: hidden_states, draft_logits, target_logits (optional)
+- validate_eagle3_target_layer_ids: exactly 5 strictly increasing layer IDs
+- extract_eagle3_context_feature: consumes target decoder layers only (no embedding -1)
+- flex_attention mask: query i attends all context + same-block-only draft
+
+### qwen3/ and gemma4/
+- Eagle3 models have draft_num_hidden_layers == 1 (single layer draft head)
+- Uses DynamicCache for recurrent state across TTT steps
+- ROPE cache with step offset (rope_cache_step_offset=True)
+
+## Data Pipeline (deepspec/data/)
+
+### parser.py
+- ChatTemplate dataclass: assistant_header, user_header, system_prompt, end_of_turn_token, assistant_loss_prefix
+- TemplateRegistry: name -> ChatTemplate mapping
+- Supported: "qwen" (im_start/im_end) and "gemma4" (turn/channel)
+- GeneralParser: tokenizer + template -> encode_chat_messages (max_length truncation)
+
+### target_cache_dataset.py
+- Target cache format v2: mmap'd binary, index struct (QIIQQQQQ per sample), shard files
+- INDEX_RECORD_STRUCT = struct.Struct("<QIIQQQQQ"): sample_offset, sample_nbytes, sample_version, input_ids_offset, loss_mask_offset, target_hidden_states_offset, target_last_hidden_states_offset
+- CacheDataset: reads from shard files, __getitem__ returns dict of tensors
+  - Keys: input_ids[seq_len], attention_mask[seq_len], loss_mask[seq_len], target_hidden_states[seq_len, num_target_layers, hidden_size], target_last_hidden_states[seq_len, hidden_size]
+  - CacheCollator: collate_fn that pads to max_seq_len, returns batch dict (CUDA prefetcher moves to GPU)
+  - ConversationCollator: also handles chat template encoding for ConversationDataset
+- ~38 TB for Qwen3-4B full dataset
+
+### cuda_prefetcher.py
+- CUDAPrefetcher: background thread + CUDA stream overlaps DataLoader iteration + H2D with compute
+- move_batch_to_device: moves tensors with non_blocking=True, casts input_ids to long
+- __next__: returns pre-fetched GPU batch, kicks off next fetch
+
+### jsonl_dataset.py
+- JsonLineDataset: mmap'd JSONL with pre-built line offset index (~/.cache/deepspec)
+- __getitem__: mmap read by offset, json.loads
+
+## Distributed Training (deepspec/utils/distributed.py)
+
+```python
+def init_dist(local_rank, timeout_minutes=60):
+    local_world_size = torch.cuda.device_count()  # GPUs on this node
+    node_rank = int(os.environ["RANK"])           # node rank (0, 1, N-1)
+    node_world_size = int(os.environ["WORLD_SIZE"])  # total nodes
+    rank = node_rank * local_world_size + local_rank
+    world_size = node_world_size * local_world_size
+    # tcp init: MASTER_ADDR:MASTER_PORT
+```
+
+Key: RANK = node rank, WORLD_SIZE = node count. Not torchrun semantics.
+train.py spawns one worker per visible GPU (torch.cuda.device_count()).
+eval.py uses same pattern.
+
+### BF16Optimizer (deepspec/utils/optim.py)
+- Master weights in fp32, model weights in bf16
+- AdamW on fp32 params, copy grad bf16->fp32, step, copy back bf16->model
+- CosineAnnealingWarmupLR: linear warmup -> cosine decay
+- scheduler.step() called inside optimizer.step()
+
+### metrics.py
+- All-reduce based distributed metrics: dp_mean, dp_sum, dp_max, dp_min, dp_last
+- add_metric(name, value, den, reduction, tag): stores (num, den) or scalar
+- flush(): all-reduce, return {name: scalar} dict
+- reset(): clear accumulated metrics
+
+## FSDP Configuration
+
+Sharding strategies (from _SHARDING_STRATEGIES dict):
+  full_shard, shard_grad_op, no_shard, hybrid_shard, hybrid_shard_zero2, _hybrid_shard_zero2
+
+Hybrid: init_device_mesh("cuda", (nodes, gpus_per_node), dim_names=("replicate", "shard"))
+MixedPrecision: param_dtype=buffer_dtype=precision_dtype (bf16)
+use_orig_params=True
+
+## Checkpoint Manager (deepspec/trainer/ckpt_manager.py)
+
+- save_checkpoint: FSDP full state dict + optimizer state + scheduler state + fp32 master weights + train_config.py
+  Writes to step_<N>/ directory, symlinks step_latest -> most recent
+- load_resume_draft_model: FSDP load_state_dict with FullStateDictConfig
+- load_training_state: restores next_micro_step, optimizer, scheduler
+- discover_latest_checkpoint: resolves step_latest symlink
+
+## SGLang Data Pipeline (scripts/data/)
+
+### launch_sglang_server.sh
+- 8 workers on ports 30000-30007, NCCL ports 31000-31007
+- Heartbeat loop every 300s
+- mem_fraction=0.9, dtype=bfloat16
+- Trap cleanup on INT/TERM/EXIT
+
+### generate_train_data.py
+- ThreadPoolExecutor concurrency (default 64)
+- OpenAI client to SGLang /v1 servers
+- Supports --enable-thinking / --disable-thinking (mutually exclusive)
+- Sampling: temperature (0-1), top_p, top_k, min_p, repetition_penalty
+- --resume: skips existing output lines
+- --is-reasoning-model / --is-gpt-oss flags
+
+### prepare_target_cache.py
+- Takes config, data path, output dir, local batch size
+- Loads target model with AutoModel, runs forward pass on all samples
+- Saves to mmap'd shards with atomic_json_dump for index
+
+## Dependencies (requirements.txt)
+- torch==2.9.1, transformers==5.10.2, numpy==2.4.4
+- triton==3.5.1 (Eagle3 loss kernel), tensorboard==2.20.0
+- datasets==4.8.5, openai==2.6.1 (data prep, NOT in install_requires)
+- yaml (PyYAML), tqdm, prettytable
+- SGLang NOT in requirements.txt (pip install "sglang[all]" separately)
+
+## Released Checkpoints (Hugging Face — 12 total)
+All trained on mlabonne/open-perfectblend in non-thinking mode:
 
 | Algorithm | Qwen3-4B | Qwen3-8B | Qwen3-14B | Gemma-4-12B |
 |-----------|----------|----------|-----------|-------------|
-| Eagle3 | deepseek-ai/eagle3_qwen3_4b_ttt7 | deepseek-ai/eagle3_qwen3_8b_ttt7 | deepseek-ai/eagle3_qwen3_14b_ttt7 | deepseek-ai/eagle3_gemma4_12b_ttt7 |
-| DFlash | deepseek-ai/dflash_qwen3_4b_block7 | deepseek-ai/dflash_qwen3_8b_block7 | deepseek-ai/dflash_qwen3_14b_block7 | deepseek-ai/dflash_gemma4_12b_block7 |
-| DSpark | deepseek-ai/dspark_qwen3_4b_block7 | deepseek-ai/dspark_qwen3_8b_block7 | deepseek-ai/dspark_qwen3_14b_block7 | deepseek-ai/dspark_gemma4_12b_block7 |
+| Eagle3 (ttt7) | deepseek-ai/eagle3_qwen3_4b_ttt7 | deepseek-ai/eagle3_qwen3_8b_ttt7 | deepseek-ai/eagle3_qwen3_14b_ttt7 | deepseek-ai/eagle3_gemma4_12b_ttt7 |
+| DFlash (block7) | deepseek-ai/dflash_qwen3_4b_block7 | deepseek-ai/dflash_qwen3_8b_block7 | deepseek-ai/dflash_qwen3_14b_block7 | deepseek-ai/dflash_gemma4_12b_block7 |
+| DSpark (block7) | deepseek-ai/dspark_qwen3_4b_block7 | deepseek-ai/dspark_qwen3_8b_block7 | deepseek-ai/dspark_qwen3_14b_block7 | deepseek-ai/dspark_gemma4_12b_block7 |
 
-## Common Mistakes (From the Codebase)
-1. Running eval without matching target model — target_name_or_path must match training config
-2. Skipping target cache — training reads from cache, not live model; build before training
-3. Insufficient storage for target cache — check disk before Stage 1.3
-4. Forgetting to install SGLang separately (pip install "sglang[all]") — not in requirements.txt
-5. Using torchrun instead of torch.multiprocessing.spawn — RANK/WORLD_SIZE mean node count, not GPU rank
-6. Data dependencies (datasets, openai) are NOT in install_requires — must install separately
+## Key Class/Function Names (for import tracking in diffs)
 
-## Dependencies
-Core: torch==2.9.1, transformers==5.10.2, numpy==2.4.4, triton==3.5.1, tensorboard==2.20.0
-Data prep: datasets==4.8.5, openai==2.6.1 (for SGLang API calls)
-CUDA build of torch needed for actual training (default wheels may not match hardware)
+Training:
+- BaseTrainer(.train, .run_batch, .build_models, ._build_train_dataloader, .save_and_eval_checkpoint)
+- Qwen3DSparkTrainer, Gemma4DSparkTrainer, Qwen3Eagle3Trainer, Gemma4Eagle3Trainer
+- BF16Optimizer(.step, .state_dict, .load_state_dict, .get_learning_rate)
+- CosineAnnealingWarmupLR, WarmupScheduler
+- CUDAPrefetcher, SuspendController
+
+Modeling:
+- Qwen3DSparkModel, Gemma4DSparkModel, Qwen3Eagle3Model, Gemma4Eagle3Model
+- DSparkForwardOutput, Eagle3ForwardOutput
+- VanillaMarkov, GatedMarkovHead, RNNHead, build_markov_head
+- AcceptRatePredictor, extract_context_feature
+- create_dspark_attention_mask, sample_anchor_positions, build_eval_mask
+- validate_target_layer_ids, validate_eagle3_target_layer_ids
+- FusedLogSoftmaxLoss (Triton autograd Function)
+
+Data:
+- CacheDataset, JsonLineDataset, CacheCollator, ConversationCollator
+- CUDAPrefetcher, move_batch_to_device
+- GeneralParser, TemplateRegistry, ChatTemplate
+- prepare_target_cache.py: TargetForwardResult, AsyncTargetCacheWriter
+
+Loss:
+- compute_dspark_loss, compute_eagle3_loss
+- _all_reduce_loss_denominators, _build_loss_weight_mask
+- _build_next_token_position_mask, _build_padded_next_token_target_probs
+
+Config:
+- ConfigNode, load_config, parse_opts_to_config, finalize_config
+- build_draft_config (per algorithm + target: build_qwen3_draft_config etc.)
+- build_qwen3_draft_config / build_gemma4_draft_config in respective config modules
+
+Eval:
+- BaseEvaluator, Qwen3DSparkEvaluator, Gemma4DSparkEvaluator
+- Qwen3Eagle3Evaluator, Gemma4Eagle3Evaluator
+- ConfidenceHeadRecorder, PerPositionConfidenceMetrics
+- DraftProposal, VerificationResult, generate_decoding_sample
+- DSparkDraftProposal, build_dspark_proposal, forward_dspark_draft_block
+
+API (train.py / eval.py):
+- train.py: --config, --opts (repeatable)
+- eval.py: --target_name_or_path, --draft_name_or_path, --max-new-tokens, --temperature, --confidence-threshold, --tensorboard-dir, --step, --seed
 
 ================================================================================
-END DOMAIN RESEARCH
+END REPO CONTEXT
 ================================================================================
 
 ## Per-PR Review Checklist
 
-### ML CORRECTNESS
-- [ ] Config parameter changes are backward-compatible with existing checkpoints
-- [ ] Loss computation matches config (ce_loss_alpha, l1_loss_alpha, loss_decay_gamma)
-- [ ] Markov head / confidence head shapes match model dimensions and config
-- [ ] block_size, num_draft_layers, target_layer_ids are consistent across config, model, and data
-- [ ] Training step doesn't silently change gradient flow (no unintended torch.no_grad)
-- [ ] mask_token_id matches the target model tokenizer (151669 for Qwen3)
+### CRITICAL — ML CORRECTNESS
 
-### DISTRIBUTED TRAINING
-- [ ] torch.multiprocessing.spawn usage correct (NOT torchrun — RANK semantics differ)
-- [ ] No hardcoded world_size or rank assumptions
-- [ ] Gradient accumulation math correct: local_batch_size * grad_acc_steps * num_gpus = global_batch_size
-- [ ] DDP wrapping correct (not FSDP unless explicitly added)
-- [ ] Seed reproducibility — same seed + same data order = same results
-- [ ] CUDA_VISIBLE_DEVICES respected everywhere
+- [ ] Loss computation: DSpark uses compute_dspark_loss (CE + optional L1 + optional confidence BCE), Eagle3 uses compute_eagle3_loss (Triton-fused soft CE with TTT loop). Check the right loss is called.
+- [ ] Loss scaling: DSpark backward uses global_denominators (all-reduced across GPUs) x world_size. Eagle3 uses FusedLogSoftmaxLoss with local_mean normalizer. Verify the right denominator.
+- [ ] Config compatibility: new config fields must not break backward-compatible checkpoint loading (full state_dict reload)
+- [ ] mask_token_id matches target model tokenizer (151669 for Qwen3, verify for Gemma4)
+- [ ] block_size, num_draft_layers, target_layer_ids consistent across config.py, build_draft_config(), and model forward
+- [ ] Markov head type ('vanilla', 'gated', 'rnn') correctly instantiated in build_markov_head()
+- [ ] Eagle3: draft_num_hidden_layers must be exactly 1 (asserted in evaluator)
+- [ ] Eagle3: validate_eagle3_target_layer_ids expects exactly 5 strictly increasing IDs
+- [ ] DSpark: target_layer_ids must be strictly increasing, optionally includes -1 (embedding layer)
+- [ ] loss_decay_gamma correctly applied (exponential decay across block positions), 0 or None = uniform
+- [ ] confidence_head_alpha > 0 requires confidence_head_with_markov in config
+- [ ] accept_rate_3d = 1 - 0.5 * |softmax(draft) - softmax(target)|_L1, clamped [0, 1] for confidence head targets
+- [ ] Gradient flow: no unintended torch.no_grad() around model forward when grads needed
+- [ ] FusedLogSoftmaxLoss backward writes in-place into logits — callers must not read logits after loss backward
+
+### CRITICAL — DISTRIBUTED TRAINING
+
+- [ ] train.py uses torch.multiprocessing.spawn, NOT torchrun. RANK env = node_rank, WORLD_SIZE = node_count
+- [ ] init_dist: rank = node_rank * local_world_size + local_rank; world_size = node_world_size * local_world_size
+- [ ] No hardcoded world_size or rank values (no assert world_size == 8 etc.)
+- [ ] Gradient accumulation: global_batch_size divisible by world_size * local_batch_size
+- [ ] FSDP sharding strategy string matches _SHARDING_STRATEGIES keys exactly (full_shard, shard_grad_op, no_shard, hybrid_shard, hybrid_shard_zero2, _hybrid_shard_zero2)
+- [ ] Hybrid sharding: init_device_mesh with correct mesh shape (nodes, gpus_per_node)
+- [ ] FSDP MixedPrecision param_dtype matches precision setting (bf16/fp16)
+- [ ] Seed reproducibility: seed_all() called before any model construction, same data order with same seed
+- [ ] torch.compile with dynamic=True doesn't break FSDP / distributed
+- [ ] hfai suspend: SuspendController thread properly cleaned up on exit
 
 ### MEMORY & PERFORMANCE
-- [ ] No accidental O(n²) in attention or markov head computations
-- [ ] Target cache I/O isn't on critical path (prefetched/async)
-- [ ] No CPU-side bottlenecks in training loop (excessive Python-to-tensor transfers)
-- [ ] eval.py doesn't load unnecessary model parts on all GPUs
-- [ ] bf16/fp16 precision handling consistent (amp, autocast, model dtype)
-- [ ] No redundant tensor copies or .item() calls in hot loops
+
+- [ ] BF16Optimizer: master fp32 weights + copy-back pattern — doubles param memory
+- [ ] CUDAPrefetcher: no CPU-side bottlenecks in hot loop (no excessive .item() calls in training loop)
+- [ ] .item() calls: CHECK for .item() inside the training loop body (not just on_optimizer_step which is only per sync step)
+- [ ] Target cache I/O: CacheDataset uses mmap, CUDAPrefetcher overlaps H2D with compute
+- [ ] FusedLogSoftmaxLoss: Triton kernel saves only m, d scalars (not [B,T,V] fp32 log-probs) — ensure this pattern isn't broken
+- [ ] No redundant tensor copies or .clone()/.detach() in hot inner loops
+- [ ] Eagle3 TTT loop: each step adds KV to DynamicCache — memory grows linearly with ttt_length * seq_len
+- [ ] DSpark: create_dspark_attention_mask is flex_attention — verify mask doesn't accidentally attend to wrong blocks
+- [ ] CUDA streams: CUDAPrefetcher uses a dedicated stream; verify sync points are correct
 
 ### DATA PIPELINE
-- [ ] Chat template handling correct ("qwen" or "gemma" supported)
-- [ ] Tokenizer special tokens handled correctly
-- [ ] Target cache path configurable via data.target_cache_path (not hardcoded)
-- [ ] Data loading handles variable-length sequences (padding, attention mask)
-- [ ] Cache format versioned or checked for compatibility on load
 
-### SGLANG INTEGRATION
-- [ ] generate_train_data.py concurrency/port handling doesn't deadlock
-- [ ] Server launch script correctly assigns GPU:port mapping (30000-30007 for 8 workers)
-- [ ] Sampling params (temperature, top_p, top_k, min_p) passed correctly
-- [ ] Server health checks / retry logic present
+- [ ] Chat template: "qwen" or "gemma" supported — other values will fail at TemplateRegistry.get()
+- [ ] Tokenizer special tokens match chat template (im_start/im_end for Qwen3, turn/channel for Gemma4)
+- [ ] Target cache: CacheDataset reads TARGET_CACHE_VERSION == 2, validates shard format on load
+- [ ] validate_train_cache() called in BaseTrainer.__init__ — ensures cache format matches model config
+- [ ] Variable-length sequences: CacheCollator pads to max_seq_len in batch
+- [ ] DataLoader params: num_workers, pin_memory=True, prefetch_factor=4, persistent_workers=True
+- [ ] Loss mask: sequences where loss_mask is all zeros should be handled (no NaN loss)
 
-### TRAINING & EVAL ORCHESTRATION
-- [ ] Checkpoint save/load works across restarts (step_* directories)
-- [ ] train.sh / eval.sh have correct CUDA_VISIBLE_DEVICES
-- [ ] eval.py benchmarks match expectations (gsm8k, math500, aime25, humaneval, mbpp, livecodebench, mt-bench, alpaca, arena-hard-v2)
-- [ ] TensorBoard logging useful (scalars beyond just loss)
-- [ ] Config override via --opts works without breaking type coercion
+### EVAL CORRECTNESS
+
+- [ ] EVALUATORS dict maps architectures[0] to evaluator class — new model types must be added here
+- [ ] BaseEvaluator.evaluate(): generates speculative decoding samples, runs verification
+- [ ] 9 benchmarks: gsm8k, math500, aime25, humaneval, mbpp, livecodebench, mt-bench, alpaca, arena-hard-v2
+- [ ] TASKS tuple: (name, max_new_tokens) — verify max_new_tokens not accidentally changed
+- [ ] DSpark: max_proposal_tokens = draft_model.block_size; Eagle3: max_proposal_tokens = draft_model.ttt_length
+- [ ] Confidence head: confidence_threshold != 0 disables confidence recording (artifact_root = None)
+- [ ] assert_no_final_target_layer: target_last_layer should not be used since it's the final layer's output
+
+### SGLANG / DATA PREP
+
+- [ ] Server port range: 30000-30007 for 8 workers, NCCL 31000-31007
+- [ ] generate_train_data.py: ThreadPoolExecutor concurrency — too high can overload SGLang servers
+- [ ] --resume flag: counts existing output lines, skips them
+- [ ] prepare_target_cache.py: ~38 TB for full Qwen3-4B dataset — verify num_target_layers or dataset size
+- [ ] SGLang NOT in requirements.txt — must be installed separately
+
+### CHECKPOINT / RESUME
+
+- [ ] Checkpoints save to step_<N>/ directories with step_latest symlink
+- [ ] load_training_state restores next_micro_step, optimizer, scheduler correctly
+- [ ] Resume: start_offset_samples = next_micro_step * local_batch_size; num_samples = remaining_micro_steps * local_batch_size
+- [ ] FSDP full state dict saving/loading: FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
 
 ## Review Tone
-Be rigorous but constructive. Flag loss computation errors, distributed setup bugs, or data pipeline issues as CRITICAL. Config-parameter mismatches between model, trainer, and data are a common footgun. Minor style notes (import ordering, type hints) can be mentioned but not blocked on.
+Be rigorous but constructive. Flag loss computation errors, distributed setup bugs, or data pipeline issues as CRITICAL — these are the most common failure modes in ML research codebases. Config-parameter mismatches between model, trainer, and data are a common footgun. Minor style notes (import ordering, type hints) can be mentioned but not blocked on.
+
+Any PR that touches loss.py, distributed.py, config.py, or base_trainer.py deserves extra scrutiny. Changes to ckpt_manager.py that affect the state_dict structure are checkpoint-breaking and deserve extra attention.
 """
 
 [pr_code_suggestions]
 extra_instructions = """
 Suggestions should be actionable and specific. Avoid generic advice.
-Prefer concrete rewrites over abstract critiques.
+Prefer concrete rewrites over abstract critiques. Include actual code snippets when suggesting changes.
 """
 
 [pr_questions]
