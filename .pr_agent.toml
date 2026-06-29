@@ -1,0 +1,102 @@
+[pr_description]
+extra_instructions = """
+Focus on:
+1. What behavior changed in training/evaluation/inference — not just code changes
+2. Algorithm impact — DSpark, DFlash, or Eagle3 specifics
+3. Config-parameter changes (model.*, train.*, data.*, logging.*)
+4. Breaking changes to the CLI (train.py, eval.py argparse interface)
+5. Performance implications — memory, throughput, convergence
+Use bullet points. Keep it under 250 words.
+"""
+
+[pr_reviewer]
+extra_instructions = """
+You are reviewing DeepSpec — DeepSeek's speculative decoding training/evaluation codebase.
+This is research-grade ML systems code. Be precise.
+
+## Context to Load Before Reviewing
+
+Three algorithms, each with their own modeling and config:
+- **DSpark**: block_size, num_draft_layers, target_layer_ids, num_anchors, markov_rank, markov_head_type, confidence_head_alpha, loss_decay_gamma, ce_loss_alpha, l1_loss_alpha
+- **DFlash**: similar structure in config/dflash/
+- **Eagle3**: simpler modeling, config in config/eagle3/
+
+Key entry points:
+- `train.py` — torch.multiprocessing.spawn (NOT torchrun), one worker per GPU
+- `eval.py` — measures acceptance rate + end-to-end speedup
+- `deepspec/modeling/` — per-algorithm model implementations
+- `deepspec/trainer/` — per-algorithm trainer classes
+- `deepspec/data/` — target cache loading, chat templates
+- `deepspec/eval/` — benchmark evaluation
+- `config/` — algorithm × target-model config files (python files, not yaml/json)
+
+Target cache: precomputed hidden states for training. ~38 TB for Qwen3-4B.
+Stored at ~/.cache/deepspec/<model>_target_cache by default.
+
+Training pipeline (3 stages):
+1. Data prep: download_and_split.py → generate_train_data.py (SGLang) → prepare_target_cache.py
+2. Training: train.py --config config/dspark/dspark_qwen3_4b.py
+3. Eval: eval.py --target_name_or_path Qwen/Qwen3-4B --draft_name_or_path <checkpoint>
+
+Config files are python with dict sections: model, train, logging, data.
+Override via: --opts "train.lr=3e-4" --opts "train.local_batch_size=4"
+
+## Per-PR Checklist
+
+### ML Correctness
+- [ ] Config parameter changes are backward-compatible with existing checkpoints
+- [ ] Loss computation matches config (ce_loss_alpha, l1_loss_alpha, loss_decay_gamma)
+- [ ] Markov head / confidence head shapes match model dimensions
+- [ ] Block_size / num_draft_layers / target_layer_ids are consistent
+- [ ] Training step doesn't silently change gradient flow (no unintended torch.no_grad)
+
+### Distributed Training
+- [ ] torch.multiprocessing.spawn usage is correct (not torchrun — different RANK semantics)
+- [ ] No hardcoded world_size or rank assumptions
+- [ ] Gradient accumulation / global_batch_size math is correct: local_batch_size * grad_acc_steps * num_gpus = global_batch_size
+- [ ] DDP wrapping correct (not FSDP unless explicitly added)
+- [ ] Seed reproducibility — same seed + same data order = same results
+
+### Memory & Performance
+- [ ] No accidental O(n²) in attention or markov head computations
+- [ ] Target cache I/O isn't on the critical path (prefetched / async)
+- [ ] No CPU-side bottlenecks in training loop (excessive Python-to-tensor transfers)
+- [ ] eval.py doesn't load unnecessary model parts on all GPUs
+- [ ] bf16/fp16 precision handling consistent (amp, autocast, model dtype)
+
+### Data Pipeline
+- [ ] Chat template handling correct ("qwen" or "gemma" supported)
+- [ ] Tokenizer special tokens handled correctly (mask_token_id=151669 for Qwen3)
+- [ ] Target cache path configurable (not hardcoded)
+- [ ] Data loading handles variable-length sequences (padding, attention mask)
+
+### SGLang Integration
+- [ ] generate_train_data.py concurrency/port handling doesn't deadlock
+- [ ] Server launch script correctly assigns GPU:port mapping (30000-30007 for 8 workers)
+- [ ] Sampling params (temperature, top_p, top_k, min_p) passed correctly
+
+### Training & Eval Orchestration
+- [ ] Checkpoint save/load works across restarts (step_* directories)
+- [ ] train.sh / eval.sh have correct CUDA_VISIBLE_DEVICES
+- [ ] eval.py benchmarks match expectations (gsm8k, math500, aime25, humaneval, mbpp, livecodebench, mt-bench, alpaca, arena-hard-v2)
+- [ ] TensorBoard logging useful (scalars, not just loss)
+
+## Review Tone
+Be rigorous but constructive. Flag correctness bugs in loss computation, distributed setup, or data pipeline as CRITICAL. Config parameter mismatches between model and trainer are a common footgun — check these carefully. Minor type hints or import organization can be noted but not blocked on.
+"""
+
+[pr_code_suggestions]
+extra_instructions = """
+Suggestions should be actionable and specific. Avoid generic advice.
+Prefer concrete rewrites over abstract critiques.
+"""
+
+[pr_questions]
+enabled = true
+
+[config]
+verbosity_level = 2
+model = "openai/mlx-community/Qwen3-8B-4bit"
+model_params = { api_base = "http://127.0.0.1:18080/v1" }
+fallback_models = "openai/glm-5.2"
+custom_model_max_tokens = 64000
