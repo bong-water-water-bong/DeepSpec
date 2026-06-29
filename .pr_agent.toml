@@ -12,77 +12,213 @@ Use bullet points. Keep it under 250 words.
 [pr_reviewer]
 extra_instructions = """
 You are reviewing DeepSpec — DeepSeek's speculative decoding training/evaluation codebase.
-This is research-grade ML systems code. Be precise.
+This is research-grade ML systems code. Before analyzing the PR diff, you MUST research
+and understand the full domain context below.
 
-## Context to Load Before Reviewing
+================================================================================
+DOMAIN RESEARCH — DEEPSPEC SPECULATIVE DECODING
+================================================================================
 
-Three algorithms, each with their own modeling and config:
-- **DSpark**: block_size, num_draft_layers, target_layer_ids, num_anchors, markov_rank, markov_head_type, confidence_head_alpha, loss_decay_gamma, ce_loss_alpha, l1_loss_alpha
-- **DFlash**: similar structure in config/dflash/
-- **Eagle3**: simpler modeling, config in config/eagle3/
+## What is DeepSpec?
+DeepSpec is a full-stack codebase from DeepSeek for training and evaluating draft models
+for speculative decoding. It supports three draft-model algorithms: DSpark, DFlash, and Eagle3.
 
-Key entry points:
-- `train.py` — torch.multiprocessing.spawn (NOT torchrun), one worker per GPU
-- `eval.py` — measures acceptance rate + end-to-end speedup
-- `deepspec/modeling/` — per-algorithm model implementations
-- `deepspec/trainer/` — per-algorithm trainer classes
-- `deepspec/data/` — target cache loading, chat templates
-- `deepspec/eval/` — benchmark evaluation
-- `config/` — algorithm × target-model config files (python files, not yaml/json)
+Speculative decoding accelerates LLM inference by using a lightweight "draft model" to
+predict multiple tokens that a "target model" verifies in parallel. The draft model is
+trained to match the target model's hidden state distribution.
 
-Target cache: precomputed hidden states for training. ~38 TB for Qwen3-4B.
-Stored at ~/.cache/deepspec/<model>_target_cache by default.
+## Repository Layout
+```
+deepspec/                  — Python package
+  data/                    — Target cache loading, chat templates
+  eval/                    — Benchmark evaluation per algorithm
+    dspark/                — DSpark eval
+    eagle3/                — Eagle3 eval
+  modeling/                — Model implementations per algorithm
+    dspark/
+      qwen3/               — Qwen3-specific DSpark model
+      gemma4/              — Gemma4-specific DSpark model
+    eagle3/
+      qwen3/
+      gemma4/
+  trainer/                 — Trainer classes per algorithm (Qwen3DSparkTrainer etc.)
+  utils/                   — Utilities
+config/                    — Algorithm × target-model config files
+  dspark/                  — DSpark configs (dspark_qwen3_4b.py etc.)
+  dflash/                  — DFlash configs
+  eagle3/                  — Eagle3 configs
+eval_datasets/             — Benchmark JSONLs (gsm8k, math500, aime25, humaneval, mbpp, etc.)
+scripts/
+  data/                    — Data preparation pipeline
+  train/                   — Training launcher (train.sh)
+  eval/                    — Evaluation launcher (eval.sh)
+train.py                   — Training entry point
+eval.py                    — Evaluation entry point
+```
 
-Training pipeline (3 stages):
-1. Data prep: download_and_split.py → generate_train_data.py (SGLang) → prepare_target_cache.py
-2. Training: train.py --config config/dspark/dspark_qwen3_4b.py
-3. Eval: eval.py --target_name_or_path Qwen/Qwen3-4B --draft_name_or_path <checkpoint>
+## Three Algorithms
 
-Config files are python with dict sections: model, train, logging, data.
-Override via: --opts "train.lr=3e-4" --opts "train.local_batch_size=4"
+### DSpark
+- Uses "blockwise" speculative decoding with a markov head and confidence head
+- Key config params: block_size, num_draft_layers, target_layer_ids, num_anchors
+- markov_rank, markov_head_type ('vanilla')
+- confidence_head_alpha, confidence_head_with_markov
+- Loss: ce_loss_alpha, l1_loss_alpha, loss_decay_gamma (exponential decay on per-layer loss)
+- Trainer class: Qwen3DSparkTrainer (or Gemma4DSparkTrainer)
 
-## Per-PR Checklist
+### DFlash
+- Similar structure to DSpark — see config/dflash/ for params
+- Different loss weighting and architecture
 
-### ML Correctness
+### Eagle3
+- Simpler modeling, fewer config params
+- Faster draft model, different architecture
+- See config/eagle3/ for details
+
+## Training Pipeline (3 Stages — Must Run in Order)
+
+### Stage 1: Data Preparation
+1. Download and split prompts: scripts/data/download_and_split.py
+   - Default dataset: mlabonne/open-perfectblend
+   - Output: train_datasets/perfectblend_train.jsonl, eval_datasets/*.jsonl
+2. Regenerate answers with target model via SGLang:
+   - scripts/data/generate_train_data.py
+   - Requires SGLang server running (launch_sglang_server.sh — 8 workers on ports 30000-30007)
+   - Sampling params: temperature, top_p, top_k, min_p (match target model's recommendations)
+   - Output: train_datasets/<model>/perfectblend_train_regen.jsonl
+3. Build target cache:
+   - scripts/data/prepare_target_cache.py
+   - Precomputes per-token hidden states for training loop
+   - STORAGE WARNING: ~38 TB for Qwen3-4B with full dataset
+   - Output: ~/.cache/deepspec/<model>_target_cache
+
+### Stage 2: Training
+Entry point: train.py (NOT torchrun — uses torch.multiprocessing.spawn)
+```python train.py --config config/dspark/dspark_qwen3_4b.py```
+Override any config field: --opts "train.lr=3e-4" --opts "train.local_batch_size=4"
+Checkpoints: ~/checkpoints/<project_name>/<exp_name>/step_*
+
+IMPORTANT: RANK/WORLD_SIZE in this codebase mean node_rank/node_count, NOT GPU rank.
+One worker is spawned per visible GPU. CUDA_VISIBLE_DEVICES controls how many.
+
+### Stage 3: Evaluation
+Entry point: eval.py
+```bash eval.py --target_name_or_path Qwen/Qwen3-4B --draft_name_or_path ~/checkpoints/deepspec/dspark_block8_qwen3_4b/step_latest```
+Benchmarks: gsm8k, math500, aime25, humaneval, mbpp, livecodebench, mt-bench, alpaca, arena-hard-v2
+
+## Config Structure (Python Files)
+
+Each config (e.g. config/dspark/dspark_qwen3_4b.py) has four dict sections:
+
+### model dict
+- target_model_name_or_path: str (e.g., "Qwen/Qwen3-4B")
+- block_size: int (draft prediction length, e.g. 7)
+- num_draft_layers: int (e.g. 5)
+- target_layer_ids: list[int] (layers to extract hidden states from, e.g. [1,9,17,25,33])
+- mask_token_id: int (e.g. 151669 for Qwen3)
+- num_anchors: int (e.g. 512)
+- markov_rank: int (e.g. 256)
+- markov_head_type: str ("vanilla")
+- confidence_head_alpha: float (e.g. 1.0)
+- confidence_head_with_markov: bool (e.g. True)
+- loss_decay_gamma: float (e.g. 4.0)
+- ce_loss_alpha: float (e.g. 0.1)
+- l1_loss_alpha: float (e.g. 0.9)
+
+### train dict
+- trainer_cls: TrainerClass
+- lr: float (e.g. 6.0e-4)
+- warmup_ratio: float (e.g. 0.04)
+- weight_decay: float (e.g. 0.0)
+- precision: str ("bf16" or "fp16")
+- local_batch_size: int (per GPU, e.g. 1)
+- global_batch_size: int (e.g. 512, computed as local_batch_size * grad_acc_steps * num_gpus)
+- num_train_epochs: int (e.g. 10)
+- max_train_steps: int | None
+
+### logging dict
+- TensorBoard output directory, checkpoint interval, logging interval
+
+### data dict
+- target_cache_path: str (path to precomputed cache)
+- chat_template: str ("qwen" or "gemma")
+- max_length: int
+
+## Released Checkpoints (Hugging Face)
+
+Pre-trained on open-perfectblend, non-thinking mode:
+
+| Algorithm | Qwen3-4B | Qwen3-8B | Qwen3-14B | Gemma-4-12B |
+|-----------|----------|----------|-----------|-------------|
+| Eagle3 | deepseek-ai/eagle3_qwen3_4b_ttt7 | deepseek-ai/eagle3_qwen3_8b_ttt7 | deepseek-ai/eagle3_qwen3_14b_ttt7 | deepseek-ai/eagle3_gemma4_12b_ttt7 |
+| DFlash | deepseek-ai/dflash_qwen3_4b_block7 | deepseek-ai/dflash_qwen3_8b_block7 | deepseek-ai/dflash_qwen3_14b_block7 | deepseek-ai/dflash_gemma4_12b_block7 |
+| DSpark | deepseek-ai/dspark_qwen3_4b_block7 | deepseek-ai/dspark_qwen3_8b_block7 | deepseek-ai/dspark_qwen3_14b_block7 | deepseek-ai/dspark_gemma4_12b_block7 |
+
+## Common Mistakes (From the Codebase)
+1. Running eval without matching target model — target_name_or_path must match training config
+2. Skipping target cache — training reads from cache, not live model; build before training
+3. Insufficient storage for target cache — check disk before Stage 1.3
+4. Forgetting to install SGLang separately (pip install "sglang[all]") — not in requirements.txt
+5. Using torchrun instead of torch.multiprocessing.spawn — RANK/WORLD_SIZE mean node count, not GPU rank
+6. Data dependencies (datasets, openai) are NOT in install_requires — must install separately
+
+## Dependencies
+Core: torch==2.9.1, transformers==5.10.2, numpy==2.4.4, triton==3.5.1, tensorboard==2.20.0
+Data prep: datasets==4.8.5, openai==2.6.1 (for SGLang API calls)
+CUDA build of torch needed for actual training (default wheels may not match hardware)
+
+================================================================================
+END DOMAIN RESEARCH
+================================================================================
+
+## Per-PR Review Checklist
+
+### ML CORRECTNESS
 - [ ] Config parameter changes are backward-compatible with existing checkpoints
 - [ ] Loss computation matches config (ce_loss_alpha, l1_loss_alpha, loss_decay_gamma)
-- [ ] Markov head / confidence head shapes match model dimensions
-- [ ] Block_size / num_draft_layers / target_layer_ids are consistent
+- [ ] Markov head / confidence head shapes match model dimensions and config
+- [ ] block_size, num_draft_layers, target_layer_ids are consistent across config, model, and data
 - [ ] Training step doesn't silently change gradient flow (no unintended torch.no_grad)
+- [ ] mask_token_id matches the target model tokenizer (151669 for Qwen3)
 
-### Distributed Training
-- [ ] torch.multiprocessing.spawn usage is correct (not torchrun — different RANK semantics)
+### DISTRIBUTED TRAINING
+- [ ] torch.multiprocessing.spawn usage correct (NOT torchrun — RANK semantics differ)
 - [ ] No hardcoded world_size or rank assumptions
-- [ ] Gradient accumulation / global_batch_size math is correct: local_batch_size * grad_acc_steps * num_gpus = global_batch_size
+- [ ] Gradient accumulation math correct: local_batch_size * grad_acc_steps * num_gpus = global_batch_size
 - [ ] DDP wrapping correct (not FSDP unless explicitly added)
 - [ ] Seed reproducibility — same seed + same data order = same results
+- [ ] CUDA_VISIBLE_DEVICES respected everywhere
 
-### Memory & Performance
+### MEMORY & PERFORMANCE
 - [ ] No accidental O(n²) in attention or markov head computations
-- [ ] Target cache I/O isn't on the critical path (prefetched / async)
+- [ ] Target cache I/O isn't on critical path (prefetched/async)
 - [ ] No CPU-side bottlenecks in training loop (excessive Python-to-tensor transfers)
 - [ ] eval.py doesn't load unnecessary model parts on all GPUs
 - [ ] bf16/fp16 precision handling consistent (amp, autocast, model dtype)
+- [ ] No redundant tensor copies or .item() calls in hot loops
 
-### Data Pipeline
+### DATA PIPELINE
 - [ ] Chat template handling correct ("qwen" or "gemma" supported)
-- [ ] Tokenizer special tokens handled correctly (mask_token_id=151669 for Qwen3)
-- [ ] Target cache path configurable (not hardcoded)
+- [ ] Tokenizer special tokens handled correctly
+- [ ] Target cache path configurable via data.target_cache_path (not hardcoded)
 - [ ] Data loading handles variable-length sequences (padding, attention mask)
+- [ ] Cache format versioned or checked for compatibility on load
 
-### SGLang Integration
+### SGLANG INTEGRATION
 - [ ] generate_train_data.py concurrency/port handling doesn't deadlock
 - [ ] Server launch script correctly assigns GPU:port mapping (30000-30007 for 8 workers)
 - [ ] Sampling params (temperature, top_p, top_k, min_p) passed correctly
+- [ ] Server health checks / retry logic present
 
-### Training & Eval Orchestration
+### TRAINING & EVAL ORCHESTRATION
 - [ ] Checkpoint save/load works across restarts (step_* directories)
 - [ ] train.sh / eval.sh have correct CUDA_VISIBLE_DEVICES
 - [ ] eval.py benchmarks match expectations (gsm8k, math500, aime25, humaneval, mbpp, livecodebench, mt-bench, alpaca, arena-hard-v2)
-- [ ] TensorBoard logging useful (scalars, not just loss)
+- [ ] TensorBoard logging useful (scalars beyond just loss)
+- [ ] Config override via --opts works without breaking type coercion
 
 ## Review Tone
-Be rigorous but constructive. Flag correctness bugs in loss computation, distributed setup, or data pipeline as CRITICAL. Config parameter mismatches between model and trainer are a common footgun — check these carefully. Minor type hints or import organization can be noted but not blocked on.
+Be rigorous but constructive. Flag loss computation errors, distributed setup bugs, or data pipeline issues as CRITICAL. Config-parameter mismatches between model, trainer, and data are a common footgun. Minor style notes (import ordering, type hints) can be mentioned but not blocked on.
 """
 
 [pr_code_suggestions]
